@@ -263,9 +263,6 @@ def filter_intermittents(unexpected_results: List[UnexpectedResult], output_path
         if filtered:
             output += [f"{text} ({len(filtered)}): ", *filtered]
 
-    def is_stable_and_unexpected(result: UnexpectedResult) -> bool:
-        return not result.flaky and not result.issues
-
     output: List[str] = []
     add_result(output, "Flaky unexpected results", unexpected_results, lambda result: result.flaky)
     add_result(
@@ -274,13 +271,13 @@ def filter_intermittents(unexpected_results: List[UnexpectedResult], output_path
         unexpected_results,
         lambda result: not result.flaky and bool(result.issues),
     )
-    add_result(output, "Stable unexpected results", unexpected_results, is_stable_and_unexpected)
+    add_result(output, "Stable unexpected results", unexpected_results, UnexpectedResult.is_stable_and_unexpected)
     print("\n".join(output))
 
     with open(output_path, "w", encoding="utf-8") as file:
         json.dump([dataclasses.asdict(result) for result in unexpected_results], file)
 
-    return not any([is_stable_and_unexpected(result) for result in unexpected_results])
+    return not any([result.is_stable_and_unexpected() for result in unexpected_results])
 
 
 def write_stable_unexpected_only_raw_log(
@@ -289,7 +286,8 @@ def write_stable_unexpected_only_raw_log(
     # Only write the data for tests which are not flaky and which do not have issues.
     # This allows the resulting log file to be used to update baselines after a CI run,
     # as it will only contain stable unexpected results without issues.
-    tests = [result.path for result in unexpected_results if not result.flaky and not result.issues]
+    tests = [result.path for result in unexpected_results if result.is_stable_and_unexpected()]
+    print(tests)
     print(f"Writing stable unexpected-only raw log to {filtered_raw_log_file}")
 
     with open(filtered_raw_log_file, "w", encoding="utf-8") as output:

@@ -108,6 +108,9 @@ class UnexpectedResult:
             lines.extend(result.stack.splitlines())
         return lines
 
+    def is_stable_and_unexpected(self) -> bool:
+        return not self.flaky and not self.issues
+
 
 class GlobalTestData(TypedDict):
     action: str
