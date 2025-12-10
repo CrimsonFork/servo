@@ -7,8 +7,8 @@ use std::rc::Rc;
 
 use app_units::Au;
 use compositing_traits::display_list::ScrollTree;
-use euclid::default::{Point2D, Rect};
-use euclid::{SideOffsets2D, Size2D};
+use euclid::default::{Point2D, Rect as UntypedRect};
+use euclid::{Rect, SideOffsets2D, Size2D};
 use itertools::Itertools;
 use layout_api::wrapper_traits::{LayoutNode, ThreadSafeLayoutElement, ThreadSafeLayoutNode};
 use layout_api::{
@@ -35,6 +35,7 @@ use style::shared_lock::SharedRwLock;
 use style::stylesheets::{CssRuleType, Origin, UrlExtraData};
 use style::stylist::RuleInclusion;
 use style::traversal::resolve_style;
+use style::values::computed::transform::{Matrix, Matrix3D};
 use style::values::computed::{Float, Size};
 use style::values::generics::font::LineHeight;
 use style::values::generics::position::AspectRatio;
@@ -44,7 +45,7 @@ use style::values::specified::text::TextTransformCase;
 use style_traits::{ParsingMode, ToCss};
 
 use crate::ArcRefCell;
-use crate::display_list::StackingContextTree;
+use crate::display_list::{StackingContextTree, au_rect_to_length_rect};
 use crate::dom::NodeExt;
 use crate::flow::inline::construct::{TextTransformation, WhitespaceCollapse, capitalize_string};
 use crate::fragment_tree::{
@@ -92,7 +93,7 @@ pub(crate) fn process_box_area_request(
     node: ServoThreadSafeLayoutNode<'_>,
     area: BoxAreaType,
     exclude_transform_and_inline: bool,
-) -> Option<Rect<Au>> {
+) -> Option<UntypedRect<Au>> {
     let rects: Vec<_> = node
         .fragments_for_pseudo(None)
         .iter()
@@ -128,7 +129,7 @@ pub(crate) fn process_box_areas_request(
     stacking_context_tree: &StackingContextTree,
     node: ServoThreadSafeLayoutNode<'_>,
     area: BoxAreaType,
-) -> Vec<Rect<Au>> {
+) -> Vec<UntypedRect<Au>> {
     let fragments = node.fragments_for_pseudo(None);
     let box_areas = fragments
         .iter()
@@ -148,7 +149,7 @@ pub(crate) fn process_box_areas_request(
         .collect()
 }
 
-pub fn process_client_rect_request(node: ServoThreadSafeLayoutNode<'_>) -> Rect<i32> {
+pub fn process_client_rect_request(node: ServoThreadSafeLayoutNode<'_>) -> UntypedRect<i32> {
     node.fragments_for_pseudo(None)
         .first()
         .map(Fragment::client_rect)
@@ -178,7 +179,7 @@ pub fn process_current_css_zoom_query(node: ServoLayoutNode<'_>) -> f32 {
 pub fn process_node_scroll_area_request(
     requested_node: Option<ServoThreadSafeLayoutNode<'_>>,
     fragment_tree: Option<Rc<FragmentTree>>,
-) -> Rect<i32> {
+) -> UntypedRect<i32> {
     let Some(tree) = fragment_tree else {
         return Rect::zero();
     };
@@ -243,6 +244,49 @@ pub fn process_resolved_style_request(
     }
     .to_physical(style.writing_mode);
 
+    // From <https://drafts.csswg.org/css-transforms-2/#serialization-of-the-computed-value>
+    let resolved_transform_value = |box_fragment: Option<&BoxFragment>| -> Result<String, ()> {
+        let transform_list = &style.get_box().transform;
+        if transform_list.0.is_empty() {
+            return Ok("none".into());
+        }
+        let length_rect = box_fragment
+            .map(|box_fragment| au_rect_to_length_rect(&box_fragment.border_rect()).to_untyped());
+        let (transform, is_3d) = transform_list.to_transform_3d_matrix(length_rect.as_ref())?;
+
+        Ok(if !is_3d {
+            Matrix {
+                a: transform.m11,
+                b: transform.m12,
+                c: transform.m21,
+                d: transform.m22,
+                e: transform.m41,
+                f: transform.m42,
+            }
+            .to_css_string()
+        } else {
+            Matrix3D {
+                m11: transform.m11,
+                m12: transform.m12,
+                m13: transform.m13,
+                m14: transform.m14,
+                m21: transform.m21,
+                m22: transform.m22,
+                m23: transform.m23,
+                m24: transform.m24,
+                m31: transform.m31,
+                m32: transform.m32,
+                m33: transform.m33,
+                m34: transform.m34,
+                m41: transform.m41,
+                m42: transform.m42,
+                m43: transform.m43,
+                m44: transform.m44,
+            }
+            .to_css_string()
+        })
+    };
+
     let computed_style = |fragment: Option<&Fragment>| match longhand_id {
         LonghandId::MinWidth
             if style.clone_min_width() == Size::Auto &&
@@ -255,6 +299,10 @@ pub fn process_resolved_style_request(
                 !should_honor_min_size_auto(fragment, style) =>
         {
             String::from("0px")
+        },
+        LonghandId::Transform => match resolved_transform_value(None) {
+            Ok(value) => value,
+            Err(..) => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
         },
         _ => style.computed_value_to_string(PropertyDeclarationId::Longhand(longhand_id)),
     };
@@ -303,6 +351,13 @@ pub fn process_resolved_style_request(
                         },
                         LonghandId::Left => {
                             return resolved_insets().left.to_css_string();
+                        },
+                        LonghandId::Transform => {
+                            // If we can compute the string do it, but otherwise fallback to a cruder serialization
+                            // of the value.
+                            if let Ok(string) = resolved_transform_value(Some(&*box_fragment)) {
+                                return string;
+                            }
                         },
                         _ => {},
                     }
@@ -1365,9 +1420,9 @@ where
 }
 
 pub(crate) fn transform_au_rectangle(
-    rect_to_transform: Rect<Au>,
+    rect_to_transform: UntypedRect<Au>,
     transform: FastLayoutTransform,
-) -> Option<Rect<Au>> {
+) -> Option<UntypedRect<Au>> {
     let rect_to_transform = &au_rect_to_f32_rect(rect_to_transform).cast_unit();
     let outer_transformed_rect = match transform {
         FastLayoutTransform::Offset(offset) => Some(rect_to_transform.translate(offset)),
